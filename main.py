@@ -22,6 +22,14 @@ SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "#security-alerts")
 client = AsyncOpenAI()
 
 
+def get_mapta_model() -> str:
+    return os.getenv("MAPTA_MODEL", "gpt-5")
+
+
+def get_mapta_reasoning_effort() -> str:
+    return os.getenv("MAPTA_REASONING_EFFORT", "high")
+
+
 # Global sandbox configuration (sanitized for open release)
 # Provide a factory via env var SANDBOX_FACTORY="your_module:create_sandbox" that returns a sandbox instance
 SANDBOX_FACTORY = os.getenv("SANDBOX_FACTORY")
@@ -80,7 +88,7 @@ class UsageTracker:
             "timestamp": datetime.now(UTC).isoformat(),
             "target_url": target_url,
             "agent_type": "main_agent",
-            "usage": usage_data
+            "usage": self.usage_to_dict(usage_data)
         }
         self.main_agent_usage.append(entry)
         logging.info(f"Main Agent Usage - Target: {target_url}, Usage: {usage_data}")
@@ -91,7 +99,7 @@ class UsageTracker:
             "timestamp": datetime.now(UTC).isoformat(),
             "target_url": target_url,
             "agent_type": "sandbox_agent", 
-            "usage": usage_data
+            "usage": self.usage_to_dict(usage_data)
         }
         self.sandbox_agent_usage.append(entry)
         logging.info(f"Sandbox Agent Usage - Target: {target_url}, Usage: {usage_data}")
@@ -103,9 +111,60 @@ class UsageTracker:
             "main_agent_calls": len(self.main_agent_usage),
             "sandbox_agent_calls": len(self.sandbox_agent_usage),
             "total_calls": len(self.main_agent_usage) + len(self.sandbox_agent_usage),
+            "token_usage": self.get_token_usage(),
             "main_agent_usage": self.main_agent_usage,
             "sandbox_agent_usage": self.sandbox_agent_usage
         }
+
+    @staticmethod
+    def usage_to_dict(usage_data):
+        """Convert SDK usage objects into JSON-serializable dictionaries."""
+        if usage_data is None:
+            return {}
+        if isinstance(usage_data, dict):
+            return usage_data
+        if hasattr(usage_data, "model_dump"):
+            return usage_data.model_dump()
+        if hasattr(usage_data, "to_dict"):
+            return usage_data.to_dict()
+        if hasattr(usage_data, "__dict__"):
+            return {
+                key: value
+                for key, value in vars(usage_data).items()
+                if not key.startswith("_")
+            }
+        return {}
+
+    def get_token_usage(self):
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+        }
+
+        def add_usage(usage):
+            if not isinstance(usage, dict):
+                return
+            input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+            output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+            total_tokens = usage.get("total_tokens") or input_tokens + output_tokens
+            totals["input_tokens"] += int(input_tokens)
+            totals["output_tokens"] += int(output_tokens)
+            totals["total_tokens"] += int(total_tokens)
+
+            input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+            if isinstance(input_details, dict):
+                totals["cached_tokens"] += int(input_details.get("cached_tokens") or 0)
+
+            output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+            if isinstance(output_details, dict):
+                totals["reasoning_tokens"] += int(output_details.get("reasoning_tokens") or 0)
+
+        for entry in [*self.main_agent_usage, *self.sandbox_agent_usage]:
+            add_usage(entry.get("usage"))
+        return totals
     
     def save_to_file(self, filename_prefix=""):
         """Save usage data to JSON file."""
@@ -543,10 +602,10 @@ async def run_sandbox_agent(instruction: str, max_rounds: int = 100):
     rounds_completed = 0
     while True:
         response = await client.responses.create(
-            model="gpt-5",
+            model=get_mapta_model(),
             tools=sandbox_tools,
             input=sandbox_input_list,
-            reasoning={ "effort": "high" },
+            reasoning={ "effort": get_mapta_reasoning_effort() },
             extra_body={
                     "metadata": {
                         "name": "sandbox_agent",
@@ -627,10 +686,10 @@ async def run_validator_agent(instruction: str, max_rounds: int = 50):
     rounds_completed = 0
     while True:
         response = await client.responses.create(
-            model="gpt-5",
+            model=get_mapta_model(),
             tools=validator_tools,
             input=validator_input_list,
-            reasoning={ "effort": "high" },
+            reasoning={ "effort": get_mapta_reasoning_effort() },
             extra_body={
                     "metadata": {
                         "name": "validator_agent",
@@ -697,7 +756,11 @@ async def sandbox_run_python(python_code: str, timeout: int = 120):
         sbx.files.write(script_path, python_code)
         
         # Execute the Python script using configured sandbox
-        result = sbx.commands.run(f"source .venv/bin/activate && python3 {script_path}", timeout=timeout, user="root")
+        result = sbx.commands.run(
+            f"if [ -f .venv/bin/activate ]; then source .venv/bin/activate; fi; python3 {script_path}",
+            timeout=timeout,
+            user="root",
+        )
 
         stdout_raw = (
             result.stdout
@@ -891,10 +954,10 @@ async def run_continuously(max_rounds: int = 100, user_prompt: str = "", system_
         while True:
             # 1) Ask the model what to do next
             response = await client.responses.create(
-                model="gpt-5",
+                model=get_mapta_model(),
                 tools=main_agent_tools,
                 input=input_list,
-                reasoning={ "effort": "high" },
+                reasoning={ "effort": get_mapta_reasoning_effort() },
                 extra_body={
                     "metadata": {
                         "name": "security_scan",

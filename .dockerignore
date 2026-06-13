@@ -1,0 +1,4 @@
+.git
+ctf-logs
+__pycache__
+*.pyc
